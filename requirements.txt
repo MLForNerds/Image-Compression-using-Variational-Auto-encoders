@@ -1,0 +1,5 @@
+image==1.5.32
+numpy==1.19.0
+Pillow==7.2.0
+tensorflow==1.15.0
+tensorflow-compression==1.3
