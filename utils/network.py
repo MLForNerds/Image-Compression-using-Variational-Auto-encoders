@@ -3,9 +3,6 @@ import tensorflow_compression as tfc
 import numpy as np
 from utils import warp
 
-SCALES_MIN = 0.11
-SCALES_MAX = 256
-SCALES_LEVELS = 64
 
 class SpyNetwork(tf.keras.layers.Layer):
     """
@@ -218,66 +215,6 @@ class SynthesisTransform(tf.keras.layers.Layer):
         return tensor
 
 
-class HyperAnalysisTransform(tf.keras.layers.Layer):
-  """The analysis transform for the entropy model parameters."""
-
-  def __init__(self, num_filters, *args, **kwargs):
-    self.num_filters = num_filters
-    super(HyperAnalysisTransform, self).__init__(*args, **kwargs)
-
-  def build(self, input_shape):
-    self._layers = [
-        tfc.SignalConv2D(
-            self.num_filters, (3, 3), name="layer_0", corr=True, strides_down=1,
-            padding="same_zeros", use_bias=True,
-            activation=tf.nn.relu),
-        tfc.SignalConv2D(
-            self.num_filters, (3, 3), name="layer_1", corr=True, strides_down=2,
-            padding="same_zeros", use_bias=True,
-            activation=tf.nn.relu),
-        tfc.SignalConv2D(
-            self.num_filters, (3, 3), name="layer_2", corr=True, strides_down=2,
-            padding="same_zeros", use_bias=False,
-            activation=None)
-    ]
-    super(HyperAnalysisTransform, self).build(input_shape)
-
-  def call(self, tensor):
-    for layer in self._layers:
-      tensor = layer(tensor)
-    return tensor
-
-
-class HyperSynthesisTransform(tf.keras.layers.Layer):
-  """The synthesis transform for the entropy model parameters."""
-
-  def __init__(self, num_filters, *args, **kwargs):
-    self.num_filters = num_filters
-    super(HyperSynthesisTransform, self).__init__(*args, **kwargs)
-
-  def build(self, input_shape):
-    self._layers = [
-        tfc.SignalConv2D(
-            self.num_filters, (3, 3), name="layer_0", corr=False, strides_up=2,
-            padding="same_zeros", use_bias=True, kernel_parameterizer=None,
-            activation=tf.nn.relu),
-        tfc.SignalConv2D(
-            self.num_filters, (3, 3), name="layer_1", corr=False, strides_up=2,
-            padding="same_zeros", use_bias=True, kernel_parameterizer=None,
-            activation=tf.nn.relu),
-        tfc.SignalConv2D(
-            self.num_filters, (3, 3), name="layer_2", corr=False, strides_up=1,
-            padding="same_zeros", use_bias=True, kernel_parameterizer=None,
-            activation=None)
-    ]
-    super(HyperSynthesisTransform, self).build(input_shape)
-
-  def call(self, tensor):
-    for layer in self._layers:
-      tensor = layer(tensor)
-    return tensor
-
-
 class ImageCompressor(tf.keras.layers.Layer):
     """
     Optical Flow and/or Residue compression
@@ -300,71 +237,32 @@ class ImageCompressor(tf.keras.layers.Layer):
     def build(self, input_shape):
         self.analysis_transform = AnalysisTransform(num_filters=self.num_filters)
         self.entropy_bottleneck = tfc.EntropyBottleneck()
-        self.hyper_analysis_transform = HyperAnalysisTransform(self.num_filters)
-        self.hyper_synthesis_transform = HyperSynthesisTransform(self.num_filters)
         self.synthesis_transform = SynthesisTransform(num_channels=self.num_channels, num_filters=self.num_filters)
         super(ImageCompressor, self).build(input_shape)
 
     def call(self, tensor, **kwargs):
         y = self.analysis_transform(tensor)
-        print("After analysis_transform:", y.shape)
-        z = self.hyper_analysis_transform(abs(y))
-        print("After hyper_analysis_transform:", z.shape)
-        z_tilde, z_likelihoods = self.entropy_bottleneck(z, training=self.training)
-        print("After entropy_bottleneck:", z_tilde.shape)
-        sigma = self.hyper_synthesis_transform(z_tilde)
-        print("After hyper_synthesis_transform:", sigma.shape)
-        scale_table = np.exp(np.linspace(
-            np.log(SCALES_MIN), np.log(SCALES_MAX), SCALES_LEVELS))
-        conditional_bottleneck = tfc.GaussianConditional(sigma, scale_table)
-        y_tilde, y_likelihoods = conditional_bottleneck(y, training=self.training)
-        print("After GaussianConditional:", y_tilde.shape)
+        y_tilde, likelihoods = self.entropy_bottleneck(y, training=self.training)
         x_tilde = self.synthesis_transform(y_tilde)
-        print("After synthesis_transform:", x_tilde.shape)
-
-        total_bits = (tf.reduce_sum(tf.log(y_likelihoods)) + tf.reduce_sum(tf.log(z_likelihoods))) / (-np.log(2))
+        total_bits = tf.reduce_sum(tf.math.log(likelihoods)) / (-np.log(2))
         return x_tilde, total_bits
 
     def compress(self, tensor):
-
-         # Transform and compress the image.
         y = self.analysis_transform(tensor)
-        y_shape = tf.shape(y)
-        z = self.hyper_analysis_transform(abs(y))
-        z_hat, z_likelihoods = self.entropy_bottleneck(z, training=False)
-        sigma = self.hyper_synthesis_transform(z_hat)
-        sigma = sigma[:, :y_shape[1], :y_shape[2], :]
-        scale_table = np.exp(np.linspace(
-            np.log(SCALES_MIN), np.log(SCALES_MAX), SCALES_LEVELS))
-        conditional_bottleneck = tfc.GaussianConditional(sigma, scale_table)
-        side_string = self.entropy_bottleneck.compress(z)
-        string = conditional_bottleneck.compress(y)
+        string = self.entropy_bottleneck.compress(y)
 
-        # Transform the quantized image back (if requested).
-        y_hat, y_likelihoods = conditional_bottleneck(y, training=False)
+        y_hat, likelihoods = self.entropy_bottleneck(y, training=False)
 
-        eval_bpp = (tf.reduce_sum(tf.log(y_likelihoods)) + tf.reduce_sum(tf.log(z_likelihoods))) / (-np.log(2))
-        return string, side_string, tf.shape(tensor)[1:-1], tf.shape(y)[1:-1], tf.shape(z)[1:-1], eval_bpp
+        eval_bpp = tf.reduce_sum(tf.log(likelihoods)) / (-np.log(2))
+        return string, tf.shape(tensor)[1:-1], tf.shape(y)[1:-1], eval_bpp
         # return string, tf.shape(tensor)[1:-1], tf.shape(y)[1:-1]
 
 
-    def decompress(self, string, side_string, x_shape, y_shape, z_shape):
-
-        # Decompress and transform the image back.
-        z_shape = tf.concat([z_shape, [self.num_filters]], axis=0)
-        z_hat = self.entropy_bottleneck.decompress(
-            side_string, z_shape, channels=self.num_filters)
-        sigma = self.hyper_synthesis_transform(z_hat)
-        sigma = sigma[:, :y_shape[0], :y_shape[1], :]
-        scale_table = np.exp(np.linspace(
-            np.log(SCALES_MIN), np.log(SCALES_MAX), SCALES_LEVELS))
-        conditional_bottleneck = tfc.GaussianConditional(
-            sigma, scale_table, dtype=tf.float32)
-        y_hat = conditional_bottleneck.decompress(string)
+    def decompress(self, string, x_shape, y_shape):
+        y_shape = tf.concat([y_shape, [self.num_filters]], axis=0)
+        y_hat = self.entropy_bottleneck.decompress(
+            string, y_shape, channels=self.num_filters)
         x_hat = self.synthesis_transform(y_hat)
-
-        # Remove batch dimension, and crop away any extraneous padding on the bottom
-        # or right boundaries.
         x_hat = x_hat[0, :x_shape[0], :x_shape[1], :]
         return x_hat
 
@@ -391,10 +289,9 @@ class VideoCompressor(tf.keras.layers.Layer):
         self.ofcomp = ImageCompressor(num_channels=2, num_filters=128, training=self.training)
         self.rescomp = ImageCompressor(num_channels=3, num_filters=128, training=self.training)
         super(VideoCompressor, self).build(input_shape)
-
+       
     def call(self, prevreconstructed, tensecond):
         tenflow = self.ofnet(prevreconstructed, tensecond)
-        print("After syp network:", tenflow.shape)
         reconflow = self.ofcomp(tenflow)
         motionCompensated = warp(prevreconstructed, reconflow[0])
         res = tensecond - motionCompensated
@@ -414,20 +311,20 @@ class VideoCompressor(tf.keras.layers.Layer):
 
     def compress(self, prevreconstructed, tensecond):
         tenflow = self.ofnet(prevreconstructed, tensecond)
-        compflow, side_compflow, cfx_shape, cfy_shape, cfz_shape, of_bpp = self.ofcomp.compress(tenflow)
-        reconflow = self.ofcomp.decompress(compflow, side_compflow, cfx_shape, cfy_shape, cfz_shape)
+        compflow, cfx_shape, cfy_shape, of_bpp = self.ofcomp.compress(tenflow)
+        reconflow = self.ofcomp.decompress(compflow, cfx_shape, cfy_shape)
         motionCompensated = warp(prevreconstructed, reconflow)
         res = tensecond - motionCompensated
-        compres, side_compres, rex_shape, rey_shape, rez_shape, res_bpp = self.rescomp.compress((res))
-        reconres = self.rescomp.decompress(compres, side_compres, rex_shape, rey_shape, rez_shape)
+        compres, rex_shape, rey_shape, res_bpp = self.rescomp.compress((res))
+        reconres = self.rescomp.decompress(compres, rex_shape, rey_shape)
         recon_image = motionCompensated + reconres
         clipped_recon_image = tf.clip_by_value(recon_image, 0, 1)
-        return compflow, side_compflow, cfx_shape, cfy_shape, cfz_shape, compres, side_compres, rex_shape, rey_shape, rez_shape, clipped_recon_image
+        return compflow, cfx_shape, cfy_shape, compres, rex_shape, rey_shape, clipped_recon_image
 
 
-    def decompress(self, prevreconstructed, compflow, side_compflow, cfx_shape, cfy_shape, cfz_shape, compres, side_compres, rex_shape, rey_shape, rez_shape):
-        reconflow = self.ofcomp.decompress(compflow, side_compflow, cfx_shape, cfy_shape, cfz_shape)
-        reconres = self.rescomp.decompress(compres, side_compres, rex_shape, rey_shape, rez_shape)
+    def decompress(self, prevreconstructed, compflow, cfx_shape, cfy_shape, compres, rex_shape, rey_shape):
+        reconflow = self.ofcomp.decompress(compflow, cfx_shape, cfy_shape)
+        reconres = self.rescomp.decompress(compres, rex_shape, rey_shape)
         motionCompensated = warp(prevreconstructed, reconflow)
         recon_image = motionCompensated + reconres
         clipped_recon_image = tf.clip_by_value(recon_image, 0, 1)
